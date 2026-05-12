@@ -1,10 +1,8 @@
 IRT-SPRT Bridge Analysis
 ========================================
-Date: 2026-05-12
-Models: 21 | Questions: 293 | Items: 25,255
 
-H12: rho=0.9117, r=0.9133, tau=0.7714, AUC=0.6395
-H12 verdict: CONFIRMED
+H12: rho=0.9117, r=0.9133 -> CONFIRMED
+H13: saving=43.2% -> CONFIRMED
+H14: degradation=51.0% -> CONFIRMED
 
-H14: 51.0% degradation, gap=0.222
-H14 verdict: CONFIRMED
+SciEntsBank: 0 Gold (exact) vs 47 (tolerance)

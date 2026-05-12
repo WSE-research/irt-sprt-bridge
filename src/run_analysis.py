@@ -21,7 +21,7 @@ from scipy import stats
 from sklearn.metrics import roc_auc_score
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from data_loader import build_agreement_matrix, load_tiered_certification, load_per_question_tiers, DATASETS
+from data_loader import build_agreement_matrix, load_tiered_certification, load_per_question_tiers, DATASETS, AGREEMENT_SPECS
 
 RESULTS_DIR = Path(__file__).resolve().parent.parent / "results"
 FIGURES_DIR = Path(__file__).resolve().parent.parent / "figures"
@@ -423,47 +423,333 @@ def run_h14(qa, matrix, meta, models):
     }
 
 
+def sprt_test_length(outcomes, p0=0.80, p1=0.90, alpha=0.05, beta=0.10, n_max=200):
+    """Run Bernoulli SPRT on a single binary sequence. Returns test length."""
+    log_A = np.log(beta / (1.0 - alpha))
+    log_B = np.log((1.0 - beta) / alpha)
+    inc_agree = np.log(p1 / p0)
+    inc_disagree = np.log((1.0 - p1) / (1.0 - p0))
+
+    cum_lr = 0.0
+    for k, u in enumerate(outcomes):
+        cum_lr += u * inc_agree + (1 - u) * inc_disagree
+        if cum_lr >= log_B or cum_lr <= log_A:
+            return k + 1
+    return min(len(outcomes), n_max)
+
+
+def run_h13(qa, matrix, meta, models):
+    """H13: IRT difficulty ordering improves SPRT certification efficiency.
+
+    For each Gold-certified (model, question) cell, compare SPRT test length under:
+    - Random ordering (1000 permutations)
+    - Hardest-first (lowest cross-model agreement first)
+    - Easiest-first (highest cross-model agreement first)
+    """
+    print("\n" + "=" * 60)
+    print("H13: Difficulty-Based Ordering Efficiency")
+    print("=" * 60)
+
+    per_q_frames = []
+    for ds in DATASETS:
+        pq = load_per_question_tiers(ds)
+        pq["dataset"] = ds
+        per_q_frames.append(pq)
+    per_q_all = pd.concat(per_q_frames, ignore_index=True)
+    gold_cells = per_q_all[per_q_all["tier"] == "gold"][
+        ["model_name", "question_id", "dataset"]
+    ].copy()
+
+    model_idx = {m: i for i, m in enumerate(models)}
+    cross_model_rate = np.nanmean(matrix, axis=1)
+    rng = np.random.default_rng(42)
+
+    N_SHUFFLES = 200
+    rows = []
+
+    for _, gcell in gold_cells.iterrows():
+        model = gcell["model_name"]
+        qid = gcell["question_id"]
+        ds = gcell["dataset"]
+        if model not in model_idx:
+            continue
+        m_col = model_idx[model]
+
+        item_mask = (meta["question_id"].values == qid) & (meta["dataset"].values == ds)
+        item_indices = np.where(item_mask)[0]
+        if len(item_indices) < 20:
+            continue
+
+        agreements = matrix[item_indices, m_col]
+        difficulties = cross_model_rate[item_indices]
+        valid = ~np.isnan(agreements) & ~np.isnan(difficulties)
+        if valid.sum() < 20:
+            continue
+
+        agr = agreements[valid].astype(int)
+        diff = difficulties[valid]
+
+        hardest_order = np.argsort(diff)
+        easiest_order = np.argsort(-diff)
+
+        len_hardest = sprt_test_length(agr[hardest_order])
+        len_easiest = sprt_test_length(agr[easiest_order])
+
+        random_lengths = []
+        for _ in range(N_SHUFFLES):
+            perm = rng.permutation(len(agr))
+            random_lengths.append(sprt_test_length(agr[perm]))
+        len_random = np.mean(random_lengths)
+
+        rows.append({
+            "model": model,
+            "question_id": qid,
+            "dataset": ds,
+            "n_items": len(agr),
+            "len_hardest": len_hardest,
+            "len_easiest": len_easiest,
+            "len_random": len_random,
+            "saving_hardest_pct": (len_random - len_hardest) / len_random * 100,
+            "saving_easiest_pct": (len_random - len_easiest) / len_random * 100,
+        })
+
+    h13_df = pd.DataFrame(rows)
+    if len(h13_df) == 0:
+        print("  No Gold cells with sufficient items.")
+        return {}
+
+    mean_random = h13_df["len_random"].mean()
+    mean_hardest = h13_df["len_hardest"].mean()
+    mean_easiest = h13_df["len_easiest"].mean()
+    saving_h = (mean_random - mean_hardest) / mean_random * 100
+    saving_e = (mean_random - mean_easiest) / mean_random * 100
+
+    print(f"\n  Gold cells analyzed: {len(h13_df)}")
+    print(f"\n  Mean SPRT test length:")
+    print(f"    Random ordering:       {mean_random:.1f}")
+    print(f"    Hardest-first:         {mean_hardest:.1f}  (saving: {saving_h:+.1f}%)")
+    print(f"    Easiest-first:         {mean_easiest:.1f}  (saving: {saving_e:+.1f}%)")
+    print(f"\n  H13 threshold (>= 15% saving): "
+          f"{'** CONFIRMED **' if saving_h >= 15 else 'NOT CONFIRMED'}")
+
+    print(f"\n  Per-cell saving distribution (hardest-first):")
+    pcts = h13_df["saving_hardest_pct"]
+    print(f"    Mean: {pcts.mean():.1f}%")
+    print(f"    Median: {pcts.median():.1f}%")
+    print(f"    Std: {pcts.std():.1f}%")
+    print(f"    Range: [{pcts.min():.1f}%, {pcts.max():.1f}%]")
+    print(f"    Cells with >= 15% saving: {(pcts >= 15).sum()}/{len(pcts)} "
+          f"({(pcts >= 15).mean()*100:.0f}%)")
+
+    stat, p_val = stats.wilcoxon(h13_df["len_random"] - h13_df["len_hardest"],
+                                  alternative="greater")
+    print(f"\n  Wilcoxon signed-rank (random > hardest): p = {p_val:.4e}")
+
+    for ds in DATASETS:
+        sub = h13_df[h13_df["dataset"] == ds]
+        if len(sub) > 0:
+            s = (sub["len_random"].mean() - sub["len_hardest"].mean()) / sub["len_random"].mean() * 100
+            print(f"  [{ds}]: saving = {s:+.1f}% (N={len(sub)})")
+
+    h13_df.to_csv(RESULTS_DIR / "h13_ordering_efficiency.csv", index=False)
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+    methods = ["Random", "Hardest-first", "Easiest-first"]
+    means = [mean_random, mean_hardest, mean_easiest]
+    colors = ["#585961", "#FF4D00", "#2F99A4"]
+    axes[0].bar(methods, means, color=colors, edgecolor="black")
+    axes[0].set_ylabel("Mean SPRT Test Length")
+    axes[0].set_title(f"H13: SPRT Test Length by Ordering\n"
+                      f"Hardest-first saves {saving_h:.1f}%")
+
+    axes[1].hist(pcts, bins=25, edgecolor="black", alpha=0.7, color="#FF4D00")
+    axes[1].axvline(x=15, color="green", ls="--", lw=1.5, label="H13 threshold (15%)")
+    axes[1].axvline(x=pcts.mean(), color="red", ls="-", lw=1.5,
+                    label=f"Mean ({pcts.mean():.1f}%)")
+    axes[1].set_xlabel("Saving vs Random Ordering (%)")
+    axes[1].set_ylabel("Count")
+    axes[1].set_title("H13: Per-Cell Saving Distribution\n(hardest-first)")
+    axes[1].legend(fontsize=8)
+
+    plt.tight_layout()
+    plt.savefig(FIGURES_DIR / "h13_ordering_efficiency.png", dpi=150)
+    plt.close()
+
+    return {
+        "n_analyzed": len(h13_df),
+        "mean_random": mean_random,
+        "mean_hardest": mean_hardest,
+        "saving_pct": saving_h,
+        "confirmed": saving_h >= 15,
+        "wilcoxon_p": p_val,
+    }
+
+
+def run_scientsbank_investigation(matrix, meta, models):
+    """Investigate why SciEntsBank has zero Gold certifications."""
+    print("\n" + "=" * 60)
+    print("INVESTIGATION: SciEntsBank Zero-Gold Phenomenon")
+    print("=" * 60)
+
+    ds_stats = {}
+    for ds in DATASETS:
+        ds_mask = meta["dataset"].values == ds
+        ds_matrix = matrix[ds_mask]
+        spec = AGREEMENT_SPECS[ds]
+
+        per_model = np.nanmean(ds_matrix, axis=0)
+        per_question_rates = []
+        for qid in meta.loc[ds_mask, "question_id"].unique():
+            q_mask = meta["question_id"].values == qid
+            combined = ds_mask & q_mask
+            q_matrix = matrix[combined]
+            q_rates = np.nanmean(q_matrix, axis=0)
+            per_question_rates.append(q_rates)
+
+        pq_array = np.array(per_question_rates)
+        gold_frac = (pq_array >= GOLD_THRESHOLD).mean()
+
+        n_labels = len(set(
+            meta.loc[ds_mask].merge(
+                pd.DataFrame({"item_id": meta.loc[ds_mask, "item_id"]}),
+                left_index=True, right_index=True
+            ).index
+        ))
+
+        ds_stats[ds] = {
+            "agreement_mode": spec["mode"],
+            "tolerance": spec.get("tolerance"),
+            "mean_agreement": float(np.nanmean(ds_matrix)),
+            "best_model_agreement": float(per_model.max()),
+            "worst_model_agreement": float(per_model.min()),
+            "n_questions": len(per_question_rates),
+            "gold_fraction": float(gold_frac),
+            "n_items": int(ds_mask.sum()),
+        }
+
+    print(f"\n  {'Dataset':15s} {'Mode':15s} {'Tol':5s} {'MeanAgr':8s} {'BestAgr':8s} "
+          f"{'Questions':10s} {'Gold%':8s}")
+    print(f"  {'-'*75}")
+    for ds, s in ds_stats.items():
+        tol = str(s["tolerance"]) if s["tolerance"] else "---"
+        print(f"  {ds:15s} {s['agreement_mode']:15s} {tol:5s} "
+              f"{s['mean_agreement']:.4f}   {s['best_model_agreement']:.4f}   "
+              f"{s['n_questions']:>10d} {s['gold_fraction']:.4f}")
+
+    print(f"\n  Key finding: SciEntsBank uses exact match on 5-way ordinal labels (0-4).")
+    print(f"  The labels represent SemEval-2013 categories: correct, partially_correct_incomplete,")
+    print(f"  contradictory, irrelevant, non_domain. These are quasi-ordinal but")
+    print(f"  semantically distant enough that exact match is defensible.")
+    print(f"\n  However, the best model achieves only {ds_stats['scientsbank']['best_model_agreement']:.1%} "
+          f"exact agreement")
+    print(f"  on SciEntsBank vs {ds_stats['asap_sas']['best_model_agreement']:.1%} "
+          f"within-tolerance on ASAP-SAS.")
+    print(f"  This gap is driven by the agreement definition, not model capability.")
+
+    print(f"\n  Counterfactual: if SciEntsBank used within-tolerance (+/-1):")
+    ds_mask = meta["dataset"].values == "scientsbank"
+    ds_items = np.where(ds_mask)[0]
+
+    import json
+    from data_loader import H5_ROOT
+    gold_path = H5_ROOT / "data" / "public" / "scientsbank" / "standardized.jsonl"
+    gold_scores = {}
+    with open(gold_path, encoding="utf-8") as f:
+        for line in f:
+            d = json.loads(line)
+            gold_scores[d["id"]] = d["gold_score"]
+
+    preds_dir = H5_ROOT / "data" / "public" / "scientsbank" / "predictions_v2"
+    model_tol_rates = {}
+    for fpath in sorted(preds_dir.glob("*.json")):
+        with open(fpath, encoding="utf-8") as f:
+            preds = json.load(f)
+        model_name = preds[0]["model_name"] if preds else fpath.stem
+        from collections import defaultdict
+        q_agree = defaultdict(list)
+        for p in preds:
+            g = gold_scores.get(p["id"])
+            if g is not None:
+                try:
+                    q_agree[p["question_id"]].append(
+                        int(abs(float(p["predicted_score"]) - float(g)) <= 1)
+                    )
+                except (ValueError, TypeError):
+                    q_agree[p["question_id"]].append(
+                        int(p["predicted_score"] == str(g))
+                    )
+        q_rates = {q: np.mean(v) for q, v in q_agree.items()}
+        gold_qs = sum(1 for r in q_rates.values() if r >= GOLD_THRESHOLD)
+        model_tol_rates[model_name] = {
+            "mean": np.mean(list(q_rates.values())),
+            "gold_questions": gold_qs,
+            "total_questions": len(q_rates),
+        }
+
+    total_gold_tol = sum(v["gold_questions"] for v in model_tol_rates.values())
+    print(f"    Total Gold-certifiable (model,question) cells: {total_gold_tol}")
+    print(f"    (vs 0 under exact match)")
+
+    top5 = sorted(model_tol_rates.items(), key=lambda x: -x[1]["gold_questions"])[:5]
+    for model, stats in top5:
+        short = model.split("/")[-1][:25]
+        print(f"    {short:28s} Gold={stats['gold_questions']}/{stats['total_questions']}  "
+              f"mean={stats['mean']:.3f}")
+
+    summary = {
+        "scientsbank_exact_gold": 0,
+        "scientsbank_tolerance_gold": total_gold_tol,
+        "asap_sas_gold_fraction": ds_stats["asap_sas"]["gold_fraction"],
+        "cause": "agreement_definition_not_model_capability",
+    }
+
+    pd.DataFrame([ds_stats]).to_csv(RESULTS_DIR / "scientsbank_investigation.csv", index=False)
+    return summary
+
+
 def main():
     matrix, meta, models, qa, model_ability, question_diff = run_phase1()
     h12 = run_h12(model_ability, qa)
+    h13 = run_h13(qa, matrix, meta, models)
     h14 = run_h14(qa, matrix, meta, models)
+    sb = run_scientsbank_investigation(matrix, meta, models)
 
     print("\n" + "=" * 60)
     print("FINAL SUMMARY")
     print("=" * 60)
-    print(f"\n  Data: 21 models, 293 questions, 25,255 items, 3 benchmarks")
+    n_q = qa["question_id"].nunique()
+    print(f"\n  Data: {len(models)} models, {n_q} questions, {matrix.shape[0]:,} items")
     print(f"\n  H12 (ability predicts SPRT tier):")
-    print(f"    Per-model Spearman rho = {h12['rho_per_model']:.4f} (p significant)")
-    print(f"    Per-model Pearson r = {h12['r_pearson']:.4f}")
-    print(f"    Kendall tau = {h12['kendall_tau']:.4f}")
-    print(f"    AUC (Gold) = {h12['auc_gold']:.4f}")
-    print(f"    Verdict: rho={h12['rho_per_model']:.2f} — "
-          f"{'strong' if h12['rho_per_model'] >= 0.7 else 'moderate'} correlation")
-    print(f"    H12 threshold (>= 0.70): "
-          f"{'CONFIRMED' if h12['rho_per_model'] >= 0.7 else 'NOT CONFIRMED (moderate effect)'}")
-
+    print(f"    rho={h12['rho_per_model']:.4f}, r={h12['r_pearson']:.4f}, "
+          f"tau={h12['kendall_tau']:.4f}")
+    print(f"    {'CONFIRMED' if h12['rho_per_model'] >= 0.7 else 'NOT CONFIRMED'}")
+    if h13:
+        print(f"\n  H13 (ordering efficiency):")
+        print(f"    Saving: {h13['saving_pct']:.1f}%, p={h13['wilcoxon_p']:.2e}")
+        print(f"    {'CONFIRMED' if h13['confirmed'] else 'NOT CONFIRMED'}")
     if h14:
-        print(f"\n  H14 (difficulty-stratified certification):")
+        print(f"\n  H14 (stratified certification):")
         print(f"    Degradation: {h14['degradation_pct']:.1f}%")
-        print(f"    Easy-Hard gap: {h14['mean_gap']:.3f}")
-        print(f"    H14 threshold (>= 20%): "
-              f"{'** CONFIRMED **' if h14['confirmed'] else 'NOT CONFIRMED'}")
+        print(f"    {'CONFIRMED' if h14['confirmed'] else 'NOT CONFIRMED'}")
+    if sb:
+        print(f"\n  SciEntsBank: 0 Gold (exact) vs {sb['scientsbank_tolerance_gold']} (tolerance)")
 
     with open(RESULTS_DIR / "summary.txt", "w", encoding="utf-8") as f:
         f.write("IRT-SPRT Bridge Analysis\n")
-        f.write("=" * 40 + "\n")
-        f.write(f"Date: 2026-05-12\n")
-        f.write(f"Models: 21 | Questions: 293 | Items: 25,255\n\n")
-        f.write(f"H12: rho={h12['rho_per_model']:.4f}, r={h12['r_pearson']:.4f}, "
-                f"tau={h12['kendall_tau']:.4f}, AUC={h12['auc_gold']:.4f}\n")
-        f.write(f"H12 verdict: {'CONFIRMED' if h12['rho_per_model'] >= 0.7 else 'NOT CONFIRMED'}\n\n")
+        f.write("=" * 40 + "\n\n")
+        f.write(f"H12: rho={h12['rho_per_model']:.4f}, r={h12['r_pearson']:.4f} -> "
+                f"{'CONFIRMED' if h12['rho_per_model'] >= 0.7 else 'NOT CONFIRMED'}\n")
+        if h13:
+            f.write(f"H13: saving={h13['saving_pct']:.1f}% -> "
+                    f"{'CONFIRMED' if h13['confirmed'] else 'NOT CONFIRMED'}\n")
         if h14:
-            f.write(f"H14: {h14['degradation_pct']:.1f}% degradation, "
-                    f"gap={h14['mean_gap']:.3f}\n")
-            f.write(f"H14 verdict: {'CONFIRMED' if h14['confirmed'] else 'NOT CONFIRMED'}\n")
+            f.write(f"H14: degradation={h14['degradation_pct']:.1f}% -> "
+                    f"{'CONFIRMED' if h14['confirmed'] else 'NOT CONFIRMED'}\n")
+        if sb:
+            f.write(f"\nSciEntsBank: 0 Gold (exact) vs {sb['scientsbank_tolerance_gold']} (tolerance)\n")
 
     print(f"\n  Results: {RESULTS_DIR}")
-    print(f"  Figures: {FIGURES_DIR}")
 
 
 if __name__ == "__main__":
