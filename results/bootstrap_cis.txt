@@ -1,0 +1,6 @@
+Bootstrap 95% Confidence Intervals (n=2000)
+==================================================
+
+H12 rho (ability vs tier): 0.8701 [0.6037, 0.9763]
+H12 rho (ability vs gold): 0.7689 [0.4808, 0.9273]
+H14 degradation: 51.0% [45.7%, 56.0%]
