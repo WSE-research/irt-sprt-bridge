@@ -1,0 +1,29 @@
+Why Confidence Ordering Fails for SPRT Certification
+=======================================================
+
+Finding: Confidence ordering is 4.4% WORSE than random for SPRT test length.
+Difficulty ordering (cross-model agreement) saves 41.3% (LOO-CV).
+
+Root cause: LLM confidence is a weak, dataset-dependent signal.
+
+Per-dataset confidence behavior:
+  ASAP-SAS: conf positively correlates with difficulty (r=+0.23)
+            -> models are MORE confident on EASIER items
+            -> low-confidence-first = slightly harder items first
+            -> but signal too weak to help (conf ordering +7.5% worse than random)
+
+  SciEntsBank: conf NEGATIVELY correlates with difficulty (r=-0.21)
+               -> models are MORE confident on HARDER items (anti-informative)
+               -> low-confidence-first = EASIER items first (exactly backwards)
+               -> this is the anti-informative confidence from NeurIPS Section 5
+
+  Mohler: weak positive correlation (r=+0.17), nearly neutral effect
+
+Key insight: Cross-model difficulty is a POPULATION-level signal (stable across
+models). Confidence is a MODEL-level signal (varies by model AND dataset in
+unpredictable ways, can be anti-informative). Population-level signals are more
+reliable for certification ordering.
+
+Confidence gap (correct vs wrong): only 0.10 globally.
+Models are barely more confident when correct than when wrong.
+This is consistent with H10 (confidence-faithfulness dissociation).
